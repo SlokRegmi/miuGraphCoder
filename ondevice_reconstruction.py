@@ -61,13 +61,14 @@ class WeightReconstructor:
 
     Given M code indices  z = (z_0, …, z_{M-1})  and codebook  C ∈ R^{K×D}:
       1. Fetch  e_m = C[z_m]  for each position  m.
-      2. Build layer weights via rank-1 outer products of code-vector pairs.
+      2. Build layer weights via rank-2 outer-product factorisation
+         (two outer products summed per layer for higher expressiveness).
 
-    Code-to-layer assignment  (M=8, D=32):
-      codes 0-1  →  GCN layer 1  W₁ ∈ R^{32×15}
-      codes 2-3  →  GCN layer 2  W₂ ∈ R^{32×32}
-      codes 4-5  →  GCN layer 3  W₃ ∈ R^{32×32}
-      codes 6-7  →  Classifier   W_cls ∈ R^{2×32}
+    Code-to-layer assignment  (M=16, D=48):
+      codes  0-3  →  GCN layer 1  W₁ ∈ R^{D×nf}  rank-2: e₀⊗e₁[:nf]ᵀ + e₂⊗e₃[:nf]ᵀ
+      codes  4-7  →  GCN layer 2  W₂ ∈ R^{D×D}   rank-2: e₄⊗e₅ᵀ + e₆⊗e₇ᵀ
+      codes  8-11 →  GCN layer 3  W₃ ∈ R^{D×D}   rank-2: e₈⊗e₉ᵀ + e₁₀⊗e₁₁ᵀ
+      codes 12-15 →  Classifier   W_cls ∈ R^{2×D} stack(e₁₂+e₁₄, e₁₃+e₁₅)
     """
 
     def __init__(self, codebook: torch.Tensor, node_feat_dim: int = 15):
@@ -80,7 +81,7 @@ class WeightReconstructor:
             Dimensionality of input node features.
         """
         self.codebook = codebook        # (K, D)
-        self.D = codebook.shape[1]      # 32
+        self.D = codebook.shape[1]      # 48
         self.node_feat_dim = node_feat_dim
 
     def __call__(self, z: torch.Tensor) -> dict[str, torch.Tensor]:
@@ -94,30 +95,29 @@ class WeightReconstructor:
         Returns
         -------
         weights : dict mapping layer name → Tensor
-            W1     : (32, 15)
-            W2     : (32, 32)
-            W3     : (32, 32)
-            W_cls  : (2, 32)
+            W1     : (D, nf)   GCN layer 1
+            W2     : (D, D)    GCN layer 2
+            W3     : (D, D)    GCN layer 3
+            W_cls  : (2, D)    classifier
         """
-        e = self.codebook[z]              # (M, D) = (8, 32)
-        D = self.D
+        e = torch.tanh(self.codebook[z])  # bound code amplitudes for stable rank-2 reconstruction
+        scale = max(self.D ** 0.5, 1.0)
         nf = self.node_feat_dim
 
-        # ── Layer 1: rank-1 outer product, 32 × 15 ──────────────────
-        # W₁ = e₀  ⊗  e₁[:nf]ᵀ
-        W1 = e[0].unsqueeze(1) * e[1][:nf].unsqueeze(0)     # (32, 15)
+        # ── Layer 1: rank-2 outer product, D × nf ───────────────────
+        W1 = (e[0].unsqueeze(1) * e[1][:nf].unsqueeze(0) +
+              e[2].unsqueeze(1) * e[3][:nf].unsqueeze(0)) / scale       # (D, nf)
 
-        # ── Layer 2: rank-1 outer product, 32 × 32 ──────────────────
-        # W₂ = e₂ ⊗ e₃ᵀ
-        W2 = e[2].unsqueeze(1) * e[3].unsqueeze(0)           # (32, 32)
+        # ── Layer 2: rank-2 outer product, D × D ────────────────────
+        W2 = (e[4].unsqueeze(1) * e[5].unsqueeze(0) +
+              e[6].unsqueeze(1) * e[7].unsqueeze(0)) / scale             # (D, D)
 
-        # ── Layer 3: rank-1 outer product, 32 × 32 ──────────────────
-        # W₃ = e₄ ⊗ e₅ᵀ
-        W3 = e[4].unsqueeze(1) * e[5].unsqueeze(0)           # (32, 32)
+        # ── Layer 3: rank-2 outer product, D × D ────────────────────
+        W3 = (e[8].unsqueeze(1) * e[9].unsqueeze(0) +
+              e[10].unsqueeze(1) * e[11].unsqueeze(0)) / scale           # (D, D)
 
-        # ── Classifier: stack two code vectors as rows, 2 × 32 ──────
-        # W_cls = [e₆ ; e₇]
-        W_cls = torch.stack([e[6], e[7]], dim=0)              # (2, 32)
+        # ── Classifier: sum code-pair per row, 2 × D ────────────────
+        W_cls = torch.stack([e[12] + e[14], e[13] + e[15]], dim=0) / 2.0  # (2, D)
 
         return {"W1": W1, "W2": W2, "W3": W3, "W_cls": W_cls}
 
@@ -195,19 +195,25 @@ class TinyGNN(nn.Module):
     Where Ã = D^{-½} (A + I) D^{-½}  is the GCN-normalised adjacency.
     """
 
-    def __init__(self, node_feat_dim: int = 15, hidden: int = 32,
-                 num_classes: int = 2):
+    def __init__(self, node_feat_dim: int = 15, hidden: int = 48,
+                 num_classes: int = 2, edge_feat_dim: int = 0):
         super().__init__()
         self.node_feat_dim = node_feat_dim
         self.hidden = hidden
         self.num_classes = num_classes
         self.num_layers = 3
+        self.edge_feat_dim = edge_feat_dim
 
         # Placeholder parameters (overwritten by load_weights)
         self.W1 = nn.Parameter(torch.empty(hidden, node_feat_dim))
         self.W2 = nn.Parameter(torch.empty(hidden, hidden))
         self.W3 = nn.Parameter(torch.empty(hidden, hidden))
         self.W_cls = nn.Parameter(torch.empty(num_classes, hidden))
+        self.edge_mlp = (nn.Sequential(
+            nn.Linear(edge_feat_dim, hidden),
+            nn.GELU(),
+            nn.Linear(hidden, num_classes),
+        ) if edge_feat_dim > 0 else None)
 
         nn.init.kaiming_uniform_(self.W1)
         nn.init.kaiming_uniform_(self.W2)
@@ -230,6 +236,16 @@ class TinyGNN(nn.Module):
             self.W2.copy_(dequantise(q_weights["W2"], scales["W2"]))
             self.W3.copy_(dequantise(q_weights["W3"], scales["W3"]))
             self.W_cls.copy_(dequantise(q_weights["W_cls"], scales["W_cls"]))
+
+    def load_edge_mlp_state(self, state_dict: dict[str, torch.Tensor]):
+        """Load the shared edge-feature residual head from the training checkpoint."""
+        if self.edge_mlp is None:
+            return
+        with torch.no_grad():
+            self.edge_mlp[0].weight.copy_(state_dict["edge_mlp.0.weight"])
+            self.edge_mlp[0].bias.copy_(state_dict["edge_mlp.0.bias"])
+            self.edge_mlp[2].weight.copy_(state_dict["edge_mlp.2.weight"])
+            self.edge_mlp[2].bias.copy_(state_dict["edge_mlp.2.bias"])
 
     @staticmethod
     def _gcn_norm(edge_index: torch.Tensor, num_nodes: int):
@@ -295,8 +311,10 @@ class TinyGNN(nn.Module):
 
         # ── Edge scoring ─────────────────────────────────────────────
         src, dst = edge_index[0], edge_index[1]
-        h_edge = h[src] * h[dst]                  # (E, 32)  Hadamard
+        h_edge = h[src] * h[dst]                  # (E, hidden)  Hadamard
         logits = h_edge @ self.W_cls.t()          # (E, 2)
+        if edge_attr is not None and self.edge_mlp is not None:
+            logits = logits + self.edge_mlp(edge_attr)
 
         return logits, h
 
@@ -317,7 +335,9 @@ class TinyGNN(nn.Module):
             f"W3 {tuple(self.W3.shape)}",
             f"  Classifier     {self.hidden:>3d} → {self.num_classes}    "
             f"W_cls {tuple(self.W_cls.shape)}",
-            f"  Edge scoring: h_edge = h[src] ⊙ h[dst]; logits = W_cls @ h_edge",
+            (f"  Edge residual   {self.edge_feat_dim:>3d} → {self.hidden} → {self.num_classes}"
+             if self.edge_mlp is not None else "  Edge residual   disabled"),
+            f"  Edge scoring: graph logits + shared edge-feature residual",
             f"  Total parameters : {self.count_params():,}",
             f"  Float32 size     : {self.size_bytes(4):,} bytes "
             f"({self.size_bytes(4)/1024:.2f} KB)",
@@ -337,9 +357,10 @@ def evaluate_on_graph(model: TinyGNN, graph: dict):
     with torch.no_grad():
         node_feat  = torch.tensor(graph["node_feat"], dtype=torch.float32)
         edge_index = torch.tensor(graph["edge_index"], dtype=torch.long)
+        edge_attr  = torch.tensor(graph["edge_attr"], dtype=torch.float32)
         edge_y     = torch.tensor(graph["edge_y"], dtype=torch.long)
 
-        logits, h = model(node_feat, edge_index)
+        logits, h = model(node_feat, edge_index, edge_attr)
         preds = logits.argmax(dim=1)
         acc = (preds == edge_y).float().mean().item()
     return acc, preds.numpy(), edge_y.numpy()
@@ -399,6 +420,7 @@ if __name__ == "__main__":
     with open(os.path.join(OUTPUT_DIR, "temporal_graphs.pkl"), "rb") as f:
         temporal_graphs = pickle.load(f)
     print(f"[INFO] Temporal graphs  :  {len(temporal_graphs)} snapshots")
+    edge_feat_dim = int(temporal_graphs[0]["edge_attr"].shape[1])
 
     labels = np.load(os.path.join(OUTPUT_DIR, "fingerprint_labels.npy"))
 
@@ -436,8 +458,9 @@ if __name__ == "__main__":
     print("[STEP 6b] Tiny GNN Architecture")
     print(f"{'─'*60}")
 
-    gnn = TinyGNN(node_feat_dim=15, hidden=32, num_classes=2)
+    gnn = TinyGNN(node_feat_dim=15, hidden=D, num_classes=2, edge_feat_dim=edge_feat_dim)
     gnn.load_weights(weights_fp32)
+    gnn.load_edge_mlp_state(ckpt["model_state_dict"])
     print(f"\n{gnn.architecture_summary()}")
 
     # Verify constraints
@@ -479,8 +502,9 @@ if __name__ == "__main__":
     print("[STEP 6d] On-Device Inference (INT8 weights)")
     print(f"{'─'*60}")
 
-    gnn_q = TinyGNN(node_feat_dim=15, hidden=32, num_classes=2)
+    gnn_q = TinyGNN(node_feat_dim=15, hidden=D, num_classes=2, edge_feat_dim=edge_feat_dim)
     gnn_q.load_quantised(q_weights, scales)
+    gnn_q.load_edge_mlp_state(ckpt["model_state_dict"])
 
     # Evaluate on all graphs
     results_fp32 = []
@@ -518,6 +542,10 @@ if __name__ == "__main__":
     # Model checkpoint
     save_dict = {
         "codebook": codebook,
+        "hw_model_state_dict": {
+            k: v.clone() for k, v in ckpt["model_state_dict"].items()
+            if k.startswith("edge_mlp.")
+        },
         "sample_z": z_sample,
         "weights_fp32": {k: v.clone() for k, v in weights_fp32.items()},
         "q_weights": {k: v.clone() for k, v in q_weights.items()},
@@ -559,15 +587,19 @@ if __name__ == "__main__":
         f.write(f"  Codebook C      : R^({K} x {D})\n")
         f.write(f"  Code positions M: {M}\n")
         f.write(f"  Code dim D      : {D}\n")
-        f.write(f"  Factorisation   : rank-1 outer product per layer pair\n")
-        f.write(f"  Transmission    : {M} indices = {M*6} bits = {M*6//8} bytes\n\n")
+        bits_per_idx = int(np.ceil(np.log2(K)))
+        total_bits = M * bits_per_idx
+        total_bytes = int(np.ceil(total_bits / 8))
+        f.write(f"  Factorisation   : rank-2 outer product per layer (4 codes/layer)\n")
+        f.write(f"  Transmission    : {M} indices x {bits_per_idx} bits = "
+                f"{total_bits} bits = {total_bytes} bytes\n\n")
 
         f.write("Code-to-Layer Assignment\n")
         f.write("-" * 40 + "\n")
-        f.write(f"  codes 0-1  ->  GCN Layer 1  W1 (32 x 15)\n")
-        f.write(f"  codes 2-3  ->  GCN Layer 2  W2 (32 x 32)\n")
-        f.write(f"  codes 4-5  ->  GCN Layer 3  W3 (32 x 32)\n")
-        f.write(f"  codes 6-7  ->  Classifier   W_cls (2 x 32)\n\n")
+        f.write(f"  codes  0-3  ->  GCN Layer 1  W1 ({D} x {15}) rank-2\n")
+        f.write(f"  codes  4-7  ->  GCN Layer 2  W2 ({D} x {D}) rank-2\n")
+        f.write(f"  codes  8-11 ->  GCN Layer 3  W3 ({D} x {D}) rank-2\n")
+        f.write(f"  codes 12-15 ->  Classifier   W_cls (2 x {D})\n\n")
 
         f.write("Tiny GNN Architecture\n")
         f.write("-" * 40 + "\n")

@@ -3,22 +3,22 @@ Step 10 — Hardware Profiling & Bandwidth Summary
 
 COMMUNICATION PAYLOAD COMPARISON
 ----------------------------------------
-  GraphCoder (z indices) :        6 bytes  (8 indices × 6 bits = 48 bits = 6 bytes)
+  GraphCoder (z indices) :       12 bytes  (16 indices × 6 bits = 96 bits = 12 bytes)
   Oracle GNN (float32)   :   11,528 bytes  (2,882 params × 4B)
   Global GNN (float32)   :   11,528 bytes  (2,882 params × 4B)
-  TinyGNN INT8 (direct)  :    2,608 bytes  (2,592 params × 1B + scales)
+  TinyGNN INT8 (direct)  :    5,440 bytes  (5,424 params × 1B + scales)
 
-  Reduction vs Oracle  : 1,921×
-  Reduction vs Global  : 1,921×
-  Reduction vs INT8    : 435×
+  Reduction vs Oracle  : 961×
+  Reduction vs Global  : 961×
+  Reduction vs INT8    : 453×
 
 ARM CORTEX-M4 PROFILING (168 MHz, INT8 inference)
 ----------------------------------------
-  p95 latency  : 0.566 ms  (target < 50 ms)  PASS
-  Peak RAM     : 43.71 KB  (target < 96 KB)  PASS
+  p95 latency  : 1.083 ms  (target < 50 ms)  PASS
+  Peak RAM     : 62.65 KB  (target < 96 KB)  PASS
 
 F1 SCORES
 ----------------------------------------
-  GraphCoder : 0.3303
-  Oracle GNN : 0.7865
-  Global GNN : 0.7003
+  GraphCoder : 0.6471
+  Oracle GNN : 0.7881
+  Global GNN : 0.6920

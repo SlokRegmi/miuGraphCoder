@@ -5,7 +5,7 @@
 LoRA Configuration
 ----------------------------------------
   Rank r             : 4 (max 4)
-  Local epochs       : 50
+  Local epochs       : 20
   Learning rate      : 0.005
   Max local samples  : 100
   Actual samples     : 100
@@ -15,36 +15,33 @@ Architecture
 LoRA-Augmented Tiny GNN  (rank r=4)
    Layer      Base shape       A shape       B shape   LoRA params
 --------------------------------------------------------------------
-      W1  torch.Size([32, 15])       (32, 4)       (15, 4)           188
-      W2  torch.Size([32, 32])       (32, 4)       (32, 4)           256
-      W3  torch.Size([32, 32])       (32, 4)       (32, 4)           256
-   W_cls  torch.Size([2, 32])        (2, 4)       (32, 4)           136
+      W1  torch.Size([48, 15])       (48, 4)       (15, 4)           252
+      W2  torch.Size([48, 48])       (48, 4)       (48, 4)           384
+      W3  torch.Size([48, 48])       (48, 4)       (48, 4)           384
+   W_cls  torch.Size([2, 48])        (2, 4)       (48, 4)           200
 --------------------------------------------------------------------
-  Base params (frozen) : 2,592
-  LoRA params (train)  : 836
-  LoRA overhead        : 32.25%
-  LoRA memory (float32): 3,344 bytes (3.27 KB)
+  Base params (frozen) : 5,424
+  LoRA params (train)  : 1,220
+  LoRA overhead        : 22.49%
+  LoRA memory (float32): 4,880 bytes (4.77 KB)
 
 Adaptation Results
 ----------------------------------------
-  Local accuracy (before)  : 0.4901
-  Local accuracy (after)   : 0.6506
-  Improvement              : +0.1605
-  Global accuracy (before) : 0.5234
-  Global accuracy (after)  : 0.4931
+  Local accuracy (before)  : 0.6388
+  Local accuracy (after)   : 0.7884
+  Improvement              : +0.1495
+  Global accuracy (before) : 0.7402
+  Global accuracy (after)  : 0.7033
 
 LoRA Delta Norms
 ----------------------------------------
-      W1  ||delta||/||base|| = 0.0586
-      W2  ||delta||/||base|| = 0.0017
-      W3  ||delta||/||base|| = 0.0260
-   W_cls  ||delta||/||base|| = 0.0773
+      W1  ||delta||/||base|| = 0.0000
+      W2  ||delta||/||base|| = 0.0000
+      W3  ||delta||/||base|| = 0.0000
+   W_cls  ||delta||/||base|| = 0.0000
 
 Training Log (sampled)
    Ep      Loss       Acc
-    1    1.3226    0.8000
-   10    0.9214    0.6600
-   20    0.5705    0.6900
-   30    0.5500    0.8000
-   40    0.5634    0.8000
-   50    0.5727    0.8000
+    1  508.3071    0.7000
+   10   11.7710    0.6800
+   20   11.2409    0.6900

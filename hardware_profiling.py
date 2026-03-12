@@ -114,10 +114,10 @@ def calc_tinygnn_int8_payload() -> dict:
     TinyGNN with INT8 quantisation: weights as int8 + per-layer float32 scales.
     """
     layers = {
-        "W1":    (32, 15),
-        "W2":    (32, 32),
-        "W3":    (32, 32),
-        "W_cls": (2, 32),
+        "W1":    (48, 15),
+        "W2":    (48, 48),
+        "W3":    (48, 48),
+        "W_cls": (2, 48),
     }
     total_weight_bytes = 0
     total_params = 0
@@ -237,7 +237,7 @@ def profile_full_inference(N: int, E: int, is_int8: bool = True) -> dict:
     Returns cycle count, time estimate, and peak RAM.
     """
     node_feat_dim = 15
-    hidden = 32
+    hidden = 48
     num_classes = 2
 
     # Profile each layer
@@ -258,12 +258,12 @@ def profile_full_inference(N: int, E: int, is_int8: bool = True) -> dict:
     peak_ram = max(l1["layer_ram_bytes"], l2["layer_ram_bytes"],
                    l3["layer_ram_bytes"], edge["layer_ram_bytes"])
 
-    # Also add: node features stored (N × 15 × 4), final h (N × 32 × 4)
+    # Also add: node features stored (N × 15 × 4), final h (N × 48 × 4)
     persistent_bytes = N * node_feat_dim * 4 + N * hidden * 4
     peak_ram += persistent_bytes
 
-    # Code index storage (8 bytes) + codebook lookup overhead
-    peak_ram += 8 + 64 * 32 * 1   # codebook in INT8 if on-device
+    # Code index storage (16 bytes for M=16) + codebook lookup (K=64, D=48, INT8)
+    peak_ram += 16 + 64 * 48 * 1   # 16-byte index packet + codebook footprint
 
     return {
         "N": N, "E": E,

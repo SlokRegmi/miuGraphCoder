@@ -61,15 +61,15 @@ from vq_codebook import VQCodebook          # Step 4 standalone module
 #  Hyper-parameters
 # =====================================================================
 FINGERPRINT_DIM = 43          # d_in   (from Step 2)
-HIDDEN_DIM      = 256         # MLP hidden width
-NUM_CODES_M     = 8           # M – sequence length of output codes
-CODE_EMB_DIM    = 32          # D – embedding dimension per code position
-CODEBOOK_SIZE_K = 64          # K – number of discrete codes
+HIDDEN_DIM      = 384         # MLP hidden width  (↑ from 256 for richer mapping)
+NUM_CODES_M     = 16          # M – code sequence length (↑ from 8; enables rank-2 recon)
+CODE_EMB_DIM    = 48          # D – embedding dim per code position  (↑ from 32)
+CODEBOOK_SIZE_K = 64          # K – number of discrete codes  (6 bits/index → 16×6=12 B)
 COMMITMENT_COST = 0.25        # beta  for VQ commitment loss
 DROPOUT         = 0.1
 
 # Training
-EPOCHS     = 300
+EPOCHS     = 400              # ↑ from 300 to compensate for larger model
 BATCH_SIZE = 32
 LR         = 3e-4
 WEIGHT_DECAY = 1e-5

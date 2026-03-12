@@ -4,46 +4,47 @@
 
 Weight Reconstruction  R(z, C)
 ----------------------------------------
-  Codebook C      : R^(64 x 32)
-  Code positions M: 8
-  Code dim D      : 32
-  Factorisation   : rank-1 outer product per layer pair
-  Transmission    : 8 indices = 48 bits = 6 bytes
+  Codebook C      : R^(64 x 48)
+  Code positions M: 16
+  Code dim D      : 48
+  Factorisation   : rank-2 outer product per layer (4 codes/layer)
+  Transmission    : 16 indices x 6 bits = 96 bits = 12 bytes
 
 Code-to-Layer Assignment
 ----------------------------------------
-  codes 0-1  ->  GCN Layer 1  W1 (32 x 15)
-  codes 2-3  ->  GCN Layer 2  W2 (32 x 32)
-  codes 4-5  ->  GCN Layer 3  W3 (32 x 32)
-  codes 6-7  ->  Classifier   W_cls (2 x 32)
+  codes  0-3  ->  GCN Layer 1  W1 (48 x 15) rank-2
+  codes  4-7  ->  GCN Layer 2  W2 (48 x 48) rank-2
+  codes  8-11 ->  GCN Layer 3  W3 (48 x 48) rank-2
+  codes 12-15 ->  Classifier   W_cls (2 x 48)
 
 Tiny GNN Architecture
 ----------------------------------------
-Tiny GNN  —  3 GCN layers, hidden=32
-  Layer 1  GCN    15 → 32   W1 (32, 15)
-  Layer 2  GCN    32 → 32   W2 (32, 32)
-  Layer 3  GCN    32 → 32   W3 (32, 32)
-  Classifier      32 → 2    W_cls (2, 32)
-  Edge scoring: h_edge = h[src] ⊙ h[dst]; logits = W_cls @ h_edge
-  Total parameters : 2,592
-  Float32 size     : 10,368 bytes (10.12 KB)
-  INT8 size        : 2,592 bytes (2.53 KB)
+Tiny GNN  —  3 GCN layers, hidden=48
+  Layer 1  GCN    15 → 48   W1 (48, 15)
+  Layer 2  GCN    48 → 48   W2 (48, 48)
+  Layer 3  GCN    48 → 48   W3 (48, 48)
+  Classifier      48 → 2    W_cls (2, 48)
+  Edge residual    12 → 48 → 2
+  Edge scoring: graph logits + shared edge-feature residual
+  Total parameters : 6,146
+  Float32 size     : 24,584 bytes (24.01 KB)
+  INT8 size        : 6,146 bytes (6.00 KB)
 
 INT8 Quantisation
 ----------------------------------------
   Method        : Per-tensor symmetric
-  Float32 size  : 10,368 bytes (10.12 KB)
-  INT8 size     : 2,592 bytes (2.53 KB)
+  Float32 size  : 21,696 bytes (21.19 KB)
+  INT8 size     : 5,424 bytes (5.30 KB)
   Compression   : 4.0x
-      W1  scale=0.011138
-      W2  scale=0.028552
-      W3  scale=0.024349
-   W_cls  scale=0.013282
+      W1  scale=0.002273
+      W2  scale=0.002273
+      W3  scale=0.002273
+   W_cls  scale=0.007874
 
 Inference Results
 ----------------------------------------
   Graphs evaluated     : 302
-  FP32 mean edge acc   : 0.5053
-  INT8 mean edge acc   : 0.5070
-  FP32<->INT8 agreement: 0.9702
-  Accuracy drop        : -0.0017
+  FP32 mean edge acc   : 0.7536
+  INT8 mean edge acc   : 0.7536
+  FP32<->INT8 agreement: 1.0000
+  Accuracy drop        : +0.0000

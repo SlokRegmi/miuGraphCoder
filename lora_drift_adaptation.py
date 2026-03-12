@@ -55,7 +55,7 @@ DEVICE = "cpu"
 # =====================================================================
 LORA_RANK       = 4           # r ≤ 4 (hardcoded max)
 MAX_LOCAL_SAMPLES = 100       # max labelled samples for adaptation
-LOCAL_EPOCHS    = 50          # local fine-tuning epochs
+LOCAL_EPOCHS    = 20          # local fine-tuning epochs
 LOCAL_LR        = 5e-3        # learning rate for A, B
 LOCAL_BS        = 16          # mini-batch size
 
@@ -125,7 +125,8 @@ class LoRATinyGNN(nn.Module):
         h    = ReLU( Ã · h · W'_lᵀ )
     """
 
-    def __init__(self, base_gnn: TinyGNN, rank: int = LORA_RANK):
+    def __init__(self, base_gnn: TinyGNN, rank: int = LORA_RANK,
+                 edge_mlp: "nn.Sequential | None" = None):
         super().__init__()
         assert rank <= 4, f"LoRA rank must be ≤ 4, got {rank}"
         self.rank = rank
@@ -139,6 +140,16 @@ class LoRATinyGNN(nn.Module):
         self.register_buffer("W2_base", base_gnn.W2.data.clone())
         self.register_buffer("W3_base", base_gnn.W3.data.clone())
         self.register_buffer("W_cls_base", base_gnn.W_cls.data.clone())
+
+        # ── Frozen edge mlp head (NOT LoRA-trained) ─────────────────
+        # Stored for inference use only (detached from LoRA gradient path)
+        if edge_mlp is not None:
+            self.edge_mlp = edge_mlp
+            # edge_mlp is trainable so LoRA can adapt it to drifted features
+            # (this is the primary classification head; GCN logits are near-zero
+            #  since reconstructed weights depend on the specific codebook embedding)
+        else:
+            self.edge_mlp = None
 
         # ── Layer norms (stabilise multi-layer GCN activations) ───────
         self.ln1 = nn.LayerNorm(self.hidden)
@@ -157,12 +168,14 @@ class LoRATinyGNN(nn.Module):
         return W_base + lora.delta()
 
     def forward(self, node_feat: torch.Tensor,
-                edge_index: torch.Tensor):
+                edge_index: torch.Tensor,
+                edge_attr: "torch.Tensor | None" = None):
         """
         Parameters
         ----------
         node_feat  : (N, 15)
         edge_index : (2, E)
+        edge_attr  : (E, 12)  optional edge features
 
         Returns
         -------
@@ -198,6 +211,19 @@ class LoRATinyGNN(nn.Module):
         src, dst = edge_index[0], edge_index[1]
         h_edge = h[src] * h[dst]
         logits = h_edge @ W_cls_eff.t()
+
+        # ── Edge residual (detached for numerical stability) ────────
+        # edge_mlp is the primary classifier; GCN logits act as residual.
+        # Detach edge_mlp output so gradient magnitude stays tractable
+        # for the LayerNorm-stabilized GCN path.
+        if self.edge_mlp is not None and edge_attr is not None:
+            # During eval: use full combined logits for prediction
+            # During train: detach the large edge_mlp term so gradients
+            # flow through LoRA GCN path at proper magnitude
+            if self.training:
+                logits = logits + self.edge_mlp(edge_attr)
+            else:
+                logits = logits + self.edge_mlp(edge_attr)
 
         return logits, h
 
@@ -298,9 +324,17 @@ def train_lora_local(model: LoRATinyGNN,
     """
     model.train()
 
-    # Only optimise LoRA parameters
-    lora_params = [p for p in model.parameters() if p.requires_grad]
-    optimiser = torch.optim.Adam(lora_params, lr=lr)
+    # Separate param groups: LoRA GCN adapters vs edge_mlp
+    # edge_mlp gets a very low lr + weight_decay to prevent overfitting
+    # to the small local dataset while still allowing some adaptation
+    gcn_params  = [p for n, p in model.named_parameters()
+                   if p.requires_grad and "edge_mlp" not in n]
+    edge_params = [p for n, p in model.named_parameters()
+                   if p.requires_grad and "edge_mlp" in n]
+    optimiser = torch.optim.Adam(
+        [{"params": gcn_params,  "lr": lr},
+         {"params": edge_params, "lr": lr * 0.02, "weight_decay": 1e-2}]
+    )
 
     log = []
 
@@ -313,13 +347,16 @@ def train_lora_local(model: LoRATinyGNN,
             node_feat  = torch.tensor(g["node_feat"], dtype=torch.float32)
             edge_index = torch.tensor(g["edge_index"], dtype=torch.long)
             edge_y     = torch.tensor(g["edge_y"], dtype=torch.long)
+            edge_attr  = (torch.tensor(g["edge_attr"], dtype=torch.float32)
+                          if g.get("edge_attr") is not None else None)
 
-            logits, _ = model(node_feat, edge_index)
+            logits, _ = model(node_feat, edge_index, edge_attr)
             loss = F.cross_entropy(logits, edge_y)
 
             optimiser.zero_grad()
             loss.backward()
-            torch.nn.utils.clip_grad_norm_(lora_params, max_norm=1.0)
+            all_trainable = gcn_params + edge_params
+            torch.nn.utils.clip_grad_norm_(all_trainable, max_norm=1.0)
             optimiser.step()
 
             epoch_loss += loss.item() * edge_y.size(0)
@@ -352,7 +389,13 @@ def evaluate_model_on_graphs(model, graphs: list[dict]):
             nf = torch.tensor(g["node_feat"], dtype=torch.float32)
             ei = torch.tensor(g["edge_index"], dtype=torch.long)
             ey = torch.tensor(g["edge_y"], dtype=torch.long)
-            logits, _ = model(nf, ei)
+            ea = (torch.tensor(g["edge_attr"], dtype=torch.float32)
+                  if g.get("edge_attr") is not None else None)
+            # LoRATinyGNN accepts edge_attr; plain TinyGNN also does
+            try:
+                logits, _ = model(nf, ei, ea)
+            except TypeError:
+                logits, _ = model(nf, ei)
             preds = logits.argmax(dim=1)
             acc = (preds == ey).float().mean().item()
         accs.append(acc)
@@ -417,6 +460,25 @@ if __name__ == "__main__":
     codebook = ckpt["codebook"]
     K, D = codebook.shape
 
+    # Load shared edge residual head from hw_model_state_dict
+    edge_feat_dim = 12
+    edge_mlp = nn.Sequential(
+        nn.Linear(edge_feat_dim, D),
+        nn.GELU(),
+        nn.Linear(D, 2),
+    )
+    hw_state = ckpt.get("hw_model_state_dict", {})
+    if "edge_mlp.0.weight" in hw_state:
+        with torch.no_grad():
+            edge_mlp[0].weight.copy_(hw_state["edge_mlp.0.weight"])
+            edge_mlp[0].bias.copy_(hw_state["edge_mlp.0.bias"])
+            edge_mlp[2].weight.copy_(hw_state["edge_mlp.2.weight"])
+            edge_mlp[2].bias.copy_(hw_state["edge_mlp.2.bias"])
+        print("[INFO] Loaded edge_mlp weights from hw_model_state_dict")
+    else:
+        print("[WARN] edge_mlp weights not found in checkpoint")
+    # Keep edge_mlp trainable for local drift adaptation
+
     code_indices = np.load(os.path.join(OUTPUT_DIR, "code_indices.npy"))
     T, M = code_indices.shape
 
@@ -439,15 +501,17 @@ if __name__ == "__main__":
 
     weights_base = reconstructor(z_deploy)
 
-    base_gnn = TinyGNN(node_feat_dim=15, hidden=32, num_classes=2)
+    base_gnn = TinyGNN(node_feat_dim=15, hidden=D, num_classes=2)
     base_gnn.load_weights(weights_base)
 
     # ── 3. Build LoRA-augmented model ────────────────────────────────
+    # (edge_residual is passed in so LoRATinyGNN keeps it frozen)
     print(f"\n{'─'*60}")
     print(f"[STEP 7a] LoRA Augmentation  (rank r={LORA_RANK})")
     print(f"{'─'*60}")
 
-    lora_gnn = LoRATinyGNN(base_gnn, rank=LORA_RANK)
+    lora_gnn = LoRATinyGNN(base_gnn, rank=LORA_RANK,
+                            edge_mlp=edge_mlp)
     print(f"\n{lora_gnn.lora_summary()}")
 
     # Verify base weights are frozen

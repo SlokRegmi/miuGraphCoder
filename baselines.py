@@ -387,14 +387,21 @@ def eval_tcn(model, graphs):
 #  GraphCoder evaluation  (from Step 6/7 artefacts)
 # =====================================================================
 
-def eval_graphcoder(graphs, code_indices, codebook):
+def eval_graphcoder(graphs, code_indices, ondevice_ckpt):
     """Evaluate reconstructed TinyGNN (GraphCoder, no LoRA) on all graphs."""
+    codebook = ondevice_ckpt["codebook"]
     reconstructor = WeightReconstructor(codebook, node_feat_dim=NODE_FEAT)
-    gnn = TinyGNN(node_feat_dim=NODE_FEAT, hidden=HIDDEN, num_classes=NUM_CLASSES)
+    hidden = codebook.shape[1]
+    edge_feat_dim = int(graphs[0]["edge_attr"].shape[1])
+    gnn = TinyGNN(node_feat_dim=NODE_FEAT, hidden=hidden, num_classes=NUM_CLASSES,
+                  edge_feat_dim=edge_feat_dim)
+    if "edge_mlp.0.weight" in ondevice_ckpt["hw_model_state_dict"]:
+        gnn.load_edge_mlp_state(ondevice_ckpt["hw_model_state_dict"])
 
     accs, f1s = [], []
     for i, g in enumerate(graphs):
         nf, ei, ey = graph_to_tensors(g)
+        edge_attr = torch.tensor(g["edge_attr"], dtype=torch.float32)
         if ey.size(0) == 0:
             continue
         z = torch.tensor(code_indices[i], dtype=torch.long)
@@ -402,7 +409,7 @@ def eval_graphcoder(graphs, code_indices, codebook):
         gnn.load_weights(weights)
         gnn.eval()
         with torch.no_grad():
-            logits, _ = gnn(nf, ei)
+            logits, _ = gnn(nf, ei, edge_attr)
             accs.append(edge_accuracy(logits, ey))
             f1s.append(edge_f1(logits, ey))
     return accs, f1s
@@ -475,7 +482,6 @@ if __name__ == "__main__":
 
     ckpt = torch.load(os.path.join(OUTPUT_DIR, "ondevice_gnn.pt"),
                       map_location="cpu", weights_only=False)
-    codebook = ckpt["codebook"]
 
     non_empty = [g for g in temporal_graphs if g["num_edges"] > 0]
     print(f"[INFO] {len(temporal_graphs)} graphs total, "
@@ -568,7 +574,7 @@ if __name__ == "__main__":
     print("[Ours] GraphCoder — VQ-reconstructed TinyGNN")
     print(f"{'─'*60}")
 
-    gc_accs, gc_f1s = eval_graphcoder(temporal_graphs, code_indices, codebook)
+    gc_accs, gc_f1s = eval_graphcoder(temporal_graphs, code_indices, ckpt)
 
     results["GraphCoder\n(ours)"] = {
         "mean_acc": np.mean(gc_accs),

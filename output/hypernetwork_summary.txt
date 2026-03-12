@@ -3,55 +3,60 @@
 ============================================================
 
 Fingerprint dim  (d_in)  : 43
-Hidden dim               : 256
-Code sequence length (M) : 8
-Code embedding dim   (D) : 32
+Hidden dim               : 384
+Code sequence length (M) : 16
+Code embedding dim   (D) : 48
 Codebook size        (K) : 64
 Commitment cost (beta)   : 0.25
-Total parameters         : 219,777
-Epochs                   : 300
+Total parameters         : 772,353
+Epochs                   : 400
 Device                   : cpu
 
 Architecture:
 Hypernetwork(
   (encoder): Sequential(
     (0): LayerNorm((43,), eps=1e-05, elementwise_affine=True)
-    (1): Linear(in_features=43, out_features=256, bias=True)
+    (1): Linear(in_features=43, out_features=384, bias=True)
     (2): GELU(approximate='none')
     (3): Dropout(p=0.1, inplace=False)
-    (4): Linear(in_features=256, out_features=256, bias=True)
+    (4): Linear(in_features=384, out_features=384, bias=True)
     (5): GELU(approximate='none')
     (6): Dropout(p=0.1, inplace=False)
-    (7): Linear(in_features=256, out_features=256, bias=True)
+    (7): Linear(in_features=384, out_features=768, bias=True)
   )
-  (vq): VQCodebook(K=64, D=32, commitment=0.25, ema_decay=0.99, dead_threshold=2)
+  (vq): VQCodebook(K=64, D=48, commitment=0.25, ema_decay=0.99, dead_threshold=2)
   (decoder): Sequential(
-    (0): Linear(in_features=256, out_features=256, bias=True)
+    (0): Linear(in_features=768, out_features=384, bias=True)
     (1): GELU(approximate='none')
     (2): Dropout(p=0.1, inplace=False)
-    (3): Linear(in_features=256, out_features=43, bias=True)
+    (3): Linear(in_features=384, out_features=43, bias=True)
   )
 )
 
 Training log (sampled):
  Epoch       Recon          VQ       Total
-     1    0.978926    0.005631    0.984558
-    20    0.488607    0.802173    1.290781
-    40    0.396379    1.080342    1.476721
-    60    0.310048    1.041432    1.351480
-    80    0.283219    0.903749    1.186968
-   100    0.239807    0.808495    1.048302
-   120    0.219201    0.773643    0.992844
-   140    0.197450    0.740983    0.938433
-   160    0.186851    0.725139    0.911990
-   180    0.183937    0.696374    0.880311
-   200    0.168382    0.740504    0.908885
-   220    0.179981    0.750365    0.930346
-   240    0.169432    0.672688    0.842120
-   260    0.176358    0.725799    0.902157
-   280    0.156439    0.703446    0.859885
-   300    0.162432    0.705453    0.867885
+     1    0.977518    0.007905    0.985423
+    20    0.491798    1.202798    1.694596
+    40    0.316988    1.235587    1.552575
+    60    0.241598    1.126419    1.368016
+    80    0.183600    0.891859    1.075459
+   100    0.159538    0.750369    0.909906
+   120    0.137252    0.622759    0.760011
+   140    0.120245    0.530001    0.650246
+   160    0.110235    0.481619    0.591854
+   180    0.095792    0.426741    0.522533
+   200    0.096272    0.392612    0.488884
+   220    0.080366    0.355556    0.435922
+   240    0.080753    0.343012    0.423764
+   260    0.077270    0.323113    0.400383
+   280    0.074273    0.293030    0.367303
+   300    0.075350    0.296584    0.371934
+   320    0.070434    0.298579    0.369013
+   340    0.077995    0.301223    0.379218
+   360    0.074333    0.292830    0.367163
+   380    0.075421    0.291858    0.367279
+   400    0.068646    0.289147    0.357793
 
-Final loss: 0.867885
-Unique codes used: 62/64
-Code indices shape: (302, 8)
+Final loss: 0.357793
+Unique codes used: 64/64
+Code indices shape: (302, 16)

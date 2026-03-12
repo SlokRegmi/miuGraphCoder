@@ -32,7 +32,7 @@ Outputs (in ./output/)
   hw_aware_summary.txt          – training summary report
 """
 
-import os, sys, time, json, warnings
+import os, sys, time, json, warnings, pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -69,6 +69,7 @@ LAMBDA_MEM      = 0.01      # λ₂  memory penalty weight
 LAT_TARGET_MS   = 2.0       # target: ≤ 2 ms per inference on MCU
 MEM_TARGET_KB   = 900.0     # target: ≤ 900 KB total footprint
 NUM_CLASSES     = 2
+GRAPH_LOSS_WT   = 2.0       # make downstream graph accuracy the dominant signal
 
 
 # =====================================================================
@@ -138,22 +139,26 @@ class LatencyLUT:
 
 class HypernetClassifier(nn.Module):
     """
-    Extends the Hypernetwork with a classification head for binary
-    event classification  (normal = 0,  attack = 1).
-
-        f_t → Encoder → VQ → z_q (B, M·D) → Classifier → logits (B, 2)
-                                             → Decoder   → f_hat  (B, d_in)
+    Extends the Hypernetwork with a fingerprint classifier and a small shared
+    edge-feature residual head used by the on-device GraphCoder scorer.
     """
 
-    def __init__(self, hypernet: Hypernetwork, num_classes: int = NUM_CLASSES):
+    def __init__(self, hypernet: Hypernetwork, num_classes: int = NUM_CLASSES,
+                 edge_feat_dim: int = 0):
         super().__init__()
         self.hypernet = hypernet
+        self.edge_feat_dim = edge_feat_dim
         self.classifier = nn.Sequential(
             nn.Linear(NUM_CODES_M * CODE_EMB_DIM, 64),
             nn.GELU(),
             nn.Dropout(DROPOUT),
             nn.Linear(64, num_classes),
         )
+        self.edge_mlp = nn.Sequential(
+            nn.Linear(edge_feat_dim, self.D),
+            nn.GELU(),
+            nn.Linear(self.D, num_classes),
+        ) if edge_feat_dim > 0 else None
 
     # ---- helpers used by surrogates ----
     @property
@@ -184,6 +189,149 @@ class HypernetClassifier(nn.Module):
         f_hat  = self.hypernet.decoder(flat_q)
 
         return logits, f_hat, z_q, indices, vq_loss, diag
+
+
+# =====================================================================
+#  Differentiable TinyGNN supervision through reconstructed weights
+# =====================================================================
+
+def reconstruct_weights_from_embeddings(z_q_sample: torch.Tensor,
+                                        node_feat_dim: int) -> dict[str, torch.Tensor]:
+    """Rebuild TinyGNN weights from quantised embeddings for one window."""
+    e = torch.tanh(z_q_sample)
+    scale = max(e.size(1) ** 0.5, 1.0)
+    nf = node_feat_dim
+
+    W1 = (e[0].unsqueeze(1) * e[1][:nf].unsqueeze(0) +
+        e[2].unsqueeze(1) * e[3][:nf].unsqueeze(0)) / scale
+    W2 = (e[4].unsqueeze(1) * e[5].unsqueeze(0) +
+        e[6].unsqueeze(1) * e[7].unsqueeze(0)) / scale
+    W3 = (e[8].unsqueeze(1) * e[9].unsqueeze(0) +
+        e[10].unsqueeze(1) * e[11].unsqueeze(0)) / scale
+    W_cls = torch.stack([e[12] + e[14], e[13] + e[15]], dim=0) / 2.0
+    return {"W1": W1, "W2": W2, "W3": W3, "W_cls": W_cls}
+
+
+def gcn_norm(edge_index: torch.Tensor, num_nodes: int) -> torch.Tensor:
+    """Symmetric GCN normalisation D^{-1/2}(A+I)D^{-1/2}."""
+    src, dst = edge_index[0], edge_index[1]
+    self_loops = torch.arange(num_nodes, device=edge_index.device)
+    src = torch.cat([src, self_loops])
+    dst = torch.cat([dst, self_loops])
+
+    deg = torch.zeros(num_nodes, device=edge_index.device)
+    deg.scatter_add_(0, dst, torch.ones_like(dst, dtype=torch.float32))
+    deg_inv_sqrt = deg.pow(-0.5)
+    deg_inv_sqrt[torch.isinf(deg_inv_sqrt)] = 0.0
+
+    weights = deg_inv_sqrt[src] * deg_inv_sqrt[dst]
+    idx = torch.stack([dst, src])
+    return torch.sparse_coo_tensor(idx, weights, size=(num_nodes, num_nodes)).coalesce()
+
+
+def tinygnn_forward_with_weights(node_feat: torch.Tensor,
+                                 edge_index: torch.Tensor,
+                                 weights: dict[str, torch.Tensor],
+                                 edge_attr: torch.Tensor | None = None,
+                                 edge_mlp: nn.Module | None = None) -> torch.Tensor:
+    """Run TinyGNN forward pass using reconstructed weights plus optional edge residual logits."""
+    num_nodes = node_feat.size(0)
+    A_norm = gcn_norm(edge_index, num_nodes)
+
+    h = torch.sparse.mm(A_norm, node_feat)
+    h = F.relu(h @ weights["W1"].t())
+
+    h = torch.sparse.mm(A_norm, h)
+    h = F.relu(h @ weights["W2"].t())
+
+    h = torch.sparse.mm(A_norm, h)
+    h = F.relu(h @ weights["W3"].t())
+
+    src, dst = edge_index[0], edge_index[1]
+    h_edge = h[src] * h[dst]
+    logits = h_edge @ weights["W_cls"].t()
+    if edge_attr is not None and edge_mlp is not None:
+        logits = logits + edge_mlp(edge_attr)
+    return logits
+
+
+def graph_batch_loss(z_q: torch.Tensor,
+                     sample_ids: torch.Tensor,
+                     graphs: list[dict],
+                     device: str) -> tuple[torch.Tensor, float, float]:
+    """
+    Compute downstream edge-classification loss for the graphs aligned with
+    the current fingerprint batch.
+    """
+    total_loss = torch.tensor(0.0, device=device)
+    total_correct = 0
+    total_edges = 0
+    used_graphs = 0
+
+    for batch_pos, sample_id in enumerate(sample_ids.tolist()):
+        graph = graphs[sample_id]
+        edge_y_np = graph["edge_y"]
+        if len(edge_y_np) == 0:
+            continue
+
+        node_feat = torch.tensor(graph["node_feat"], dtype=torch.float32, device=device)
+        edge_index = torch.tensor(graph["edge_index"], dtype=torch.long, device=device)
+        edge_attr = torch.tensor(graph["edge_attr"], dtype=torch.float32, device=device)
+        edge_y = torch.tensor(edge_y_np, dtype=torch.long, device=device)
+
+        weights = reconstruct_weights_from_embeddings(z_q[batch_pos], node_feat.size(1))
+        edge_logits = tinygnn_forward_with_weights(node_feat, edge_index, weights,
+                                                   edge_attr=edge_attr,
+                                                   edge_mlp=model.edge_mlp)
+        total_loss = total_loss + F.cross_entropy(edge_logits, edge_y)
+
+        preds = edge_logits.argmax(dim=1)
+        total_correct += (preds == edge_y).sum().item()
+        total_edges += edge_y.numel()
+        used_graphs += 1
+
+    if used_graphs == 0:
+        return torch.tensor(0.0, device=device), 0.0, 0.0
+
+    mean_loss = total_loss / used_graphs
+    edge_acc = total_correct / max(total_edges, 1)
+    return mean_loss, edge_acc, float(total_edges)
+
+
+def evaluate_graphcoder_from_embeddings(z_q: torch.Tensor,
+                                        graphs: list[dict],
+                                        edge_mlp: nn.Module | None,
+                                        device: str) -> tuple[float, float]:
+    """Return mean per-graph edge accuracy and micro edge accuracy."""
+    graph_accs = []
+    total_correct = 0
+    total_edges = 0
+
+    for sample_id in range(z_q.size(0)):
+        graph = graphs[sample_id]
+        edge_y_np = graph["edge_y"]
+        if len(edge_y_np) == 0:
+            continue
+
+        node_feat = torch.tensor(graph["node_feat"], dtype=torch.float32, device=device)
+        edge_index = torch.tensor(graph["edge_index"], dtype=torch.long, device=device)
+        edge_attr = torch.tensor(graph["edge_attr"], dtype=torch.float32, device=device)
+        edge_y = torch.tensor(edge_y_np, dtype=torch.long, device=device)
+
+        weights = reconstruct_weights_from_embeddings(z_q[sample_id], node_feat.size(1))
+        logits = tinygnn_forward_with_weights(node_feat, edge_index, weights,
+                                              edge_attr=edge_attr,
+                                              edge_mlp=edge_mlp)
+        preds = logits.argmax(dim=1)
+
+        correct = (preds == edge_y).sum().item()
+        total_correct += correct
+        total_edges += edge_y.numel()
+        graph_accs.append(correct / edge_y.numel())
+
+    mean_graph_acc = float(np.mean(graph_accs)) if graph_accs else 0.0
+    micro_edge_acc = total_correct / max(total_edges, 1)
+    return mean_graph_acc, micro_edge_acc
 
 
 # =====================================================================
@@ -235,11 +383,14 @@ def memory_surrogate(model: HypernetClassifier,
         param_mem = param_mem + p.abs().mean() * p.numel() * 4.0   # bytes
 
     # ── activation footprint (constant, per batch_size=1) ────────────
-    # Encoder:  LN(43) + h1(256) + h2(256) + proj(256)   =  811 floats
-    # VQ:       z_q (256)                                  =  256 floats
+    # Encoder:  LN(d_in) + h1(hidden) + h2(hidden) + proj(M*D)
+    # VQ:       z_q (M*D)
     # Classifier: h(64) + logits(2)                        =   66 floats
-    # Decoder: h(256) + f_hat(43)                          =  299 floats
-    act_floats   = 43 + 256 + 256 + 256 + 256 + 64 + 2 + 256 + 43
+    # Decoder: h(hidden) + f_hat(d_in)
+    d_in = model.hypernet.encoder[0].normalized_shape[0]
+    hidden = model.hypernet.encoder[1].out_features
+    md = model.M * model.D
+    act_floats = d_in + hidden + hidden + md + md + 64 + 2 + hidden + d_in
     act_bytes    = batch_size * act_floats * 4
     act_const    = torch.tensor(float(act_bytes), device=dev)
 
@@ -275,9 +426,9 @@ class HardwareAwareLoss(nn.Module):
         else:
             self.class_weights = None
 
-    def forward(self, model, logits, labels, f_hat, f_t, vq_loss, batch_size):
+    def forward(self, model, task_loss, f_hat, f_t, vq_loss, batch_size):
         # ── Task loss (cross-entropy) ────────────────────────────────
-        L_task = F.cross_entropy(logits, labels, weight=self.class_weights)
+        L_task = task_loss
 
         # ── Reconstruction auxiliary loss ────────────────────────────
         L_recon = F.mse_loss(f_hat, f_t)
@@ -318,6 +469,7 @@ def train(model: HypernetClassifier,
           loss_fn: HardwareAwareLoss,
           X: np.ndarray,
           y: np.ndarray,
+          graphs: list[dict],
           epochs: int   = EPOCHS,
           bs: int       = BATCH_SIZE,
           lr: float     = LR,
@@ -328,7 +480,8 @@ def train(model: HypernetClassifier,
 
     X_t = torch.tensor(X, dtype=torch.float32)
     y_t = torch.tensor(y, dtype=torch.long)
-    dataset = TensorDataset(X_t, y_t)
+    id_t = torch.arange(len(y), dtype=torch.long)
+    dataset = TensorDataset(X_t, y_t, id_t)
     loader  = DataLoader(dataset, batch_size=bs, shuffle=True, drop_last=False)
 
     optimiser = torch.optim.AdamW(model.parameters(), lr=lr,
@@ -341,18 +494,22 @@ def train(model: HypernetClassifier,
     for epoch in range(1, epochs + 1):
         epoch_m = {k: 0.0 for k in ["L_total", "L_task", "L_recon",
                                       "L_vq", "L_lat", "L_mem",
-                                      "lat_ms", "mem_kb"]}
+                                      "lat_ms", "mem_kb", "edge_acc"]}
         n_correct = 0
         n_total   = 0
         n_batches = 0
 
-        for batch_x, batch_y in loader:
+        for batch_x, batch_y, batch_ids in loader:
             batch_x = batch_x.to(device)
             batch_y = batch_y.to(device)
 
             logits, f_hat, z_q, indices, vq_loss, diag = model(batch_x)
+            graph_loss, edge_acc, num_edges = graph_batch_loss(z_q, batch_ids,
+                                                               graphs, device)
+            classifier_loss = F.cross_entropy(logits, batch_y, weight=loss_fn.class_weights)
+            task_loss = GRAPH_LOSS_WT * graph_loss + 0.25 * classifier_loss
 
-            L, metrics = loss_fn(model, logits, batch_y, f_hat,
+            L, metrics = loss_fn(model, task_loss, f_hat,
                                  batch_x, vq_loss, batch_x.size(0))
 
             optimiser.zero_grad()
@@ -361,9 +518,11 @@ def train(model: HypernetClassifier,
             optimiser.step()
 
             for k in epoch_m:
-                epoch_m[k] += metrics[k]
-            n_correct += (logits.argmax(dim=1) == batch_y).sum().item()
-            n_total   += batch_y.size(0)
+                if k != "edge_acc":
+                    epoch_m[k] += metrics[k]
+            epoch_m["edge_acc"] += edge_acc
+            n_correct += edge_acc * num_edges
+            n_total   += num_edges
             n_batches += 1
 
         scheduler.step()
@@ -371,7 +530,8 @@ def train(model: HypernetClassifier,
         # Average over batches
         for k in epoch_m:
             epoch_m[k] /= n_batches
-        epoch_m["accuracy"] = n_correct / n_total
+        epoch_m["accuracy"] = n_correct / max(n_total, 1)
+        epoch_m["edge_acc"] /= n_batches
         epoch_m["epoch"]    = epoch
 
         log.append(epoch_m)
@@ -380,7 +540,7 @@ def train(model: HypernetClassifier,
             print(f"  Ep {epoch:>4d}/{epochs}  "
                   f"L={epoch_m['L_total']:.4f}  "
                   f"CE={epoch_m['L_task']:.4f}  "
-                  f"acc={epoch_m['accuracy']:.3f}  "
+                f"edge_acc={epoch_m['accuracy']:.3f}  "
                   f"lat={epoch_m['lat_ms']:.3f}ms  "
                   f"mem={epoch_m['mem_kb']:.1f}KB")
 
@@ -465,16 +625,20 @@ if __name__ == "__main__":
     t0 = time.time()
 
     # ── 1. Load data ─────────────────────────────────────────────────
-    fp_path  = os.path.join(OUTPUT_DIR, "fingerprints.npy")
-    lbl_path = os.path.join(OUTPUT_DIR, "fingerprint_labels.npy")
+    fp_path   = os.path.join(OUTPUT_DIR, "fingerprints.npy")
+    lbl_path  = os.path.join(OUTPUT_DIR, "fingerprint_labels.npy")
+    graph_path = os.path.join(OUTPUT_DIR, "temporal_graphs.pkl")
     ckpt_path = os.path.join(OUTPUT_DIR, "hypernetwork_state.pt")
 
     print("[INFO] Loading fingerprints & labels …")
     fingerprints = np.load(fp_path).astype(np.float32)
     fingerprints = np.nan_to_num(fingerprints, nan=0.0, posinf=0.0, neginf=0.0)
     labels = np.load(lbl_path).astype(np.int64)
+    with open(graph_path, "rb") as f:
+        temporal_graphs = pickle.load(f)
     T, d_in = fingerprints.shape
     print(f"       {T} samples, dim={d_in}, classes={np.unique(labels)}")
+    print(f"       {len(temporal_graphs)} temporal graphs loaded")
 
     # Standardise
     fp_mean = fingerprints.mean(axis=0)
@@ -498,7 +662,9 @@ if __name__ == "__main__":
     )
     print(f"       Hypernetwork loaded  ({sum(p.numel() for p in hypernet.parameters()):,} params)")
 
-    model = HypernetClassifier(hypernet, num_classes=NUM_CLASSES)
+    edge_feat_dim = int(temporal_graphs[0]["edge_attr"].shape[1])
+    model = HypernetClassifier(hypernet, num_classes=NUM_CLASSES,
+                               edge_feat_dim=edge_feat_dim)
     total_params = sum(p.numel() for p in model.parameters())
     cls_params   = sum(p.numel() for p in model.classifier.parameters())
     print(f"       + Classifier head    ({cls_params:,} params)")
@@ -530,7 +696,7 @@ if __name__ == "__main__":
 
     # ── 4. Train ─────────────────────────────────────────────────────
     print(f"\n[INFO] Training for {EPOCHS} epochs on {DEVICE} …")
-    log = train(model, loss_fn, X_norm, labels)
+    log = train(model, loss_fn, X_norm, labels, temporal_graphs)
 
     # ── 5. Final evaluation ──────────────────────────────────────────
     model.eval()
@@ -539,14 +705,18 @@ if __name__ == "__main__":
         y_t = torch.tensor(labels, dtype=torch.long).to(DEVICE)
         logits, f_hat, z_q, indices, vq_loss, diag = model(X_t)
         preds = logits.argmax(dim=1)
-        acc = (preds == y_t).float().mean().item()
+        cls_acc = (preds == y_t).float().mean().item()
+        acc, micro_edge_acc = evaluate_graphcoder_from_embeddings(z_q, temporal_graphs,
+                                                                  model.edge_mlp, DEVICE)
         lat_final = latency_surrogate(model, lut).item()
         mem_final = memory_surrogate(model).item()
 
     print(f"\n{'='*60}")
     print(f"  Final Results")
     print(f"{'='*60}")
-    print(f"  Accuracy          : {acc:.4f}  ({(preds == y_t).sum().item()}/{T})")
+    print(f"  Mean edge accuracy: {acc:.4f}")
+    print(f"  Micro edge acc    : {micro_edge_acc:.4f}")
+    print(f"  Fingerprint acc   : {cls_acc:.4f}  ({(preds == y_t).sum().item()}/{T})")
     print(f"  Latency (pred)    : {lat_final:.3f} ms   (target ≤ {LAT_TARGET_MS} ms)")
     print(f"  Memory  (pred)    : {mem_final:.1f} KB    (target ≤ {MEM_TARGET_KB} KB)")
     print(f"  Lat within target : {'YES' if lat_final <= LAT_TARGET_MS else 'NO'}")
@@ -568,10 +738,17 @@ if __name__ == "__main__":
             "mem_target":  MEM_TARGET_KB,
         },
         "final_accuracy":  acc,
+        "final_micro_edge_accuracy": micro_edge_acc,
+        "final_fingerprint_accuracy": cls_acc,
         "final_latency_ms": lat_final,
         "final_memory_kb":  mem_final,
     }, save_path)
     print(f"\n[INFO] Model saved         -> {save_path}")
+
+    # Save refreshed transmitted code indices from the finetuned model
+    idx_path = os.path.join(OUTPUT_DIR, "code_indices.npy")
+    np.save(idx_path, indices.cpu().numpy().astype(np.int64))
+    print(f"[INFO] Code indices        -> {idx_path}")
 
     # Training log
     log_path = os.path.join(OUTPUT_DIR, "hw_aware_training_log.json")
@@ -598,6 +775,7 @@ if __name__ == "__main__":
         f.write(f"  Weight decay     : {WEIGHT_DECAY}\n")
         f.write(f"  lambda_lat       : {LAMBDA_LAT}\n")
         f.write(f"  lambda_mem       : {LAMBDA_MEM}\n")
+        f.write(f"  graph_loss_wt    : {GRAPH_LOSS_WT}\n")
         f.write(f"  Lat target       : {LAT_TARGET_MS} ms\n")
         f.write(f"  Mem target       : {MEM_TARGET_KB} KB\n")
         f.write(f"  Num classes      : {NUM_CLASSES}\n\n")
