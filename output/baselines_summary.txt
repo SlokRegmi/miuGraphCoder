@@ -1,0 +1,32 @@
+=================================================================
+  Step 8 — Rigorous Baselines
+=================================================================
+
+Task: Edge-level binary classification (normal vs attack)
+Graphs: 302 total, 302 non-empty
+
+Methods
+----------------------------------------
+  1. Oracle GNN   — per-graph fully fine-tuned (upper bound)
+  2. Global GNN   — single fixed model, all devices
+  3. LSTM          — non-graph, node-pair temporal
+  4. TCN           — non-graph, temporal convolution
+  5. GraphCoder   — VQ-reconstructed TinyGNN (ours)
+
+Method                       Acc      std       F1      std    Params
+-----------------------------------------------------------------
+Oracle GNN (per-device)    0.9052   0.1278   0.7865   0.2197     2,882
+Global GNN (single fixed)    0.8209   0.2102   0.7003   0.2532     2,882
+LSTM (non-graph)          0.7124   0.2373   0.5871   0.2513    10,178
+TCN (non-graph)           0.8992   0.1394   0.8250   0.2034     7,938
+GraphCoder (ours)         0.5053   0.2672   0.3303   0.1603     2,592
+
+
+Architecture Details
+----------------------------------------
+  All models: hidden=32, num_classes=2
+  Oracle GNN : 3 GCN layers + LN, trained per graph (200 ep)
+  Global GNN : 3 GCN layers + LN, trained on all (100 ep)
+  LSTM       : 1-layer LSTM on edge features [xu;xv;xu*xv]
+  TCN        : 2 causal conv blocks (k=3, d=1,2) on edge feats
+  GraphCoder : 3 GCN layers, weights from R(z,C)

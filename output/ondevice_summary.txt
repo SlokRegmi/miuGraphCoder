@@ -1,0 +1,49 @@
+============================================================
+  Step 6 — On-Device Weight Reconstruction + INT8
+============================================================
+
+Weight Reconstruction  R(z, C)
+----------------------------------------
+  Codebook C      : R^(64 x 32)
+  Code positions M: 8
+  Code dim D      : 32
+  Factorisation   : rank-1 outer product per layer pair
+  Transmission    : 8 indices = 48 bits = 6 bytes
+
+Code-to-Layer Assignment
+----------------------------------------
+  codes 0-1  ->  GCN Layer 1  W1 (32 x 15)
+  codes 2-3  ->  GCN Layer 2  W2 (32 x 32)
+  codes 4-5  ->  GCN Layer 3  W3 (32 x 32)
+  codes 6-7  ->  Classifier   W_cls (2 x 32)
+
+Tiny GNN Architecture
+----------------------------------------
+Tiny GNN  —  3 GCN layers, hidden=32
+  Layer 1  GCN    15 → 32   W1 (32, 15)
+  Layer 2  GCN    32 → 32   W2 (32, 32)
+  Layer 3  GCN    32 → 32   W3 (32, 32)
+  Classifier      32 → 2    W_cls (2, 32)
+  Edge scoring: h_edge = h[src] ⊙ h[dst]; logits = W_cls @ h_edge
+  Total parameters : 2,592
+  Float32 size     : 10,368 bytes (10.12 KB)
+  INT8 size        : 2,592 bytes (2.53 KB)
+
+INT8 Quantisation
+----------------------------------------
+  Method        : Per-tensor symmetric
+  Float32 size  : 10,368 bytes (10.12 KB)
+  INT8 size     : 2,592 bytes (2.53 KB)
+  Compression   : 4.0x
+      W1  scale=0.011138
+      W2  scale=0.028552
+      W3  scale=0.024349
+   W_cls  scale=0.013282
+
+Inference Results
+----------------------------------------
+  Graphs evaluated     : 302
+  FP32 mean edge acc   : 0.5053
+  INT8 mean edge acc   : 0.5070
+  FP32<->INT8 agreement: 0.9702
+  Accuracy drop        : -0.0017

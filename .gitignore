@@ -1,0 +1,7 @@
+/dataset/*
+*.csv
+*.json
+*.xlsx
+*.xls
+*.parquet
+__pycache__/

@@ -1,0 +1,48 @@
+=================================================================
+  Step 4 – VQ Codebook Diagnostics
+=================================================================
+
+--- 1. Straight-Through Estimator (STE) Gradient Flow ---
+  Encoder gradients flow through STE : PASS
+  Decoder gradients present          : PASS
+  Input gradients via STE            : PASS
+    encoder.0.weight              grad_norm=0.152570
+  VQ loss from forward: 0.134969
+  Diagnostics: perplexity=51.61, utilization=100.00%
+
+--- 2. EMA Codebook Update ---
+  Codebook changed after EMA update  : YES
+  Mean |Δ embed|                     : 1.10918105
+  Max  |Δ embed|                     : 5.13710642
+  EMA decay (γ)                      : 0.99
+
+--- 3. Codebook Utilization ---
+  Codebook size (K)        : 64
+  Code dimension (D)       : 32
+  Code sequence length (M) : 8
+  Unique codes used        : 64/64  (100.0%)
+  Most  used code          : index 25 (count=166)
+  Least used code (>0)     : index 60 (count=1)
+  Unused codes             : 0
+  Code count std           : 41.72
+  EMA active codes         : 64/64
+  EMA mean cluster size    : 1.0000
+  EMA std cluster size     : 0.0000
+  Last perplexity          : 38.77
+
+--- 4. Dead-Code Revival ---
+  Killed 4 codes (cluster_size=0)
+  Codes revived by revival  : 16
+  Cluster sizes after revival: all >= 1.0? PASS
+
+--- 5. Reconstruction Quality ---
+  Overall reconstruction MSE : 0.152046
+  Per-dim MSE range          : [0.058476, 0.303477]
+  Mean per-dim MSE           : 0.152046
+  Pearson correlation (orig ↔ recon) : 0.9246
+
+--- 6. Generating Visualisations ---
+  Saved: C:\Users\Administrator\Desktop\final niu\output\codebook_embeddings_pca.png
+  Saved: C:\Users\Administrator\Desktop\final niu\output\codebook_usage_hist.png
+
+=================================================================
